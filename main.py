@@ -19,6 +19,8 @@ def main():
                         help='数据分割方法 (iid, non-iid, dirichlet)')
     parser.add_argument('--alpha', type=float, default=0.5, 
                         help='Dirichlet分布的参数，控制数据非IID程度')
+    parser.add_argument('--labelp', type=float, default=1,
+                        help='rate of labeled data')
 
     # 客户端参数
     parser.add_argument('--num-clients', type=int, default=10, 
@@ -27,7 +29,7 @@ def main():
                         help='每个客户端的本地训练轮次')
     parser.add_argument('--batch-size', type=int, default=32, 
                         help='批次大小')
-    parser.add_argument('--lr', type=float, default=0.001, 
+    parser.add_argument('--lr', type=float, default=0.1,
                         help='学习率')
     parser.add_argument('--optimizer', type=str, default='sgd', 
                         help='优化器 (sgd, adam)')
@@ -44,9 +46,10 @@ def main():
     parser.add_argument('--num-gpus', type=int, default=torch.cuda.device_count(), 
                         help='使用的GPU总数量')
 
-    # MoE参数
-    parser.add_argument('--use-moe', action='store_true', default=True,
-                        help='是否使用MoE训练')
+    # method参数
+    parser.add_argument('--method', type=str, default='labelonly',
+                        help='method (labelonly, fedmatch, labelonly+MOE, EMMT+MOE)',
+                        choices=['labelonly', 'labelonly+MOE', 'fedmatch', 'EMMT+MOE', 'fullsl'])
     parser.add_argument('--moe-strategy', type=str, default='multi_expert', 
                         help='专家学习策略 (single_expert, multi_expert)')
 
