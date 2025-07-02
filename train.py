@@ -27,7 +27,9 @@ def create_model(model_name: str = "resnet18", num_classes: int = 10, pretrained
         model = models.resnet18(pretrained=pretrained)
         backbone = nn.Sequential(*list(model.children())[:-1])
         decoder = nn.Linear(model.fc.in_features, num_classes)
+
         gate = nn.Linear(model.fc.in_features, 1)  # 可学门控模型
+
         return backbone, decoder, gate
     elif model_name.lower() == "simple_cnn":
         class SimpleCNN(nn.Module):
@@ -140,6 +142,17 @@ class DataSplitter:
         
         return client_indices
 
+    @staticmethod
+    def split_l_u(num_clients: int, label_prop: float, client_indices: List[List[int]]) -> (List[List[int]], List[List[int]]):
+        label_indices = []
+        unlabel_indices = []
+        for i in range(num_clients):
+            num_label = int(label_prop * len(client_indices[i]))
+            label_indices.append(client_indices[i][:num_label])
+            unlabel_indices.append(client_indices[i][num_label:])
+
+        return label_indices, unlabel_indices
+
 def run_federated_learning(rank, server_instance, client_instance, args):
     if args.num_gpus > 1:
         setup(rank, args.num_gpus, port=12355 + rank)
@@ -176,6 +189,8 @@ def run_federated_learning(rank, server_instance, client_instance, args):
         client_indices = DataSplitter.dirichlet_split(train_dataset, args.num_clients, alpha=args.alpha)
     else:
         raise ValueError(f"不支持的数据分割方法: {args.split_method}")
+
+    label_indices, unlabel_indices = DataSplitter.split_l_u(args.num_clients, args.labelp, client_indices)
     
     # 创建全局测试数据加载器
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
@@ -227,7 +242,8 @@ def run_federated_learning(rank, server_instance, client_instance, args):
     # 服务器只在第一个进程上运行
     if rank == 0:
         print(f"服务器使用GPU: {server_gpus}")
-        server = server_instance(global_backbone, global_decoder, server_gpus, args.aggregation, use_moe=args.use_moe, moe_strategy=args.moe_strategy)
+        server = server_instance(global_backbone, global_decoder, server_gpus, args.aggregation,
+                                 use_moe='moe' in args.method, moe_strategy=args.moe_strategy)
         
         # 记录全局模型性能
         server.evaluate(test_loader)
@@ -240,7 +256,11 @@ def run_federated_learning(rank, server_instance, client_instance, args):
     clients = []
     for i in range(start_client, end_client):
         # 为每个客户端创建本地数据集
-        client_train_data = Subset(train_dataset, client_indices[i])
+        if 'fullsl' in args.method:
+            client_train_data = Subset(train_dataset, client_indices[i])
+        else:
+            client_train_data = Subset(train_dataset, label_indices[i])
+            client_unlabel_data = Subset(train_dataset, unlabel_indices[i])
         client_test_data = test_dataset  # 所有客户端使用相同的测试集
         
         # 每个客户端有自己的模型副本
@@ -263,7 +283,7 @@ def run_federated_learning(rank, server_instance, client_instance, args):
             epochs=args.local_epochs,
             optimizer=args.optimizer,
             criterion=nn.CrossEntropyLoss(),
-            use_moe=args.use_moe,
+            use_moe='moe' in args.method,
             moe_strategy=args.moe_strategy
         )
         clients.append(client)
@@ -276,14 +296,14 @@ def run_federated_learning(rank, server_instance, client_instance, args):
         if rank == 0:
             broadcast_params = server.broadcast()
             global_backbone_params = broadcast_params['global_backbone']
-            if args.use_moe:
+            if 'moe' in args.method:
                 expert_decoder_params = broadcast_params['expert_decoder']
         
         # 同步全局模型到所有GPU
         if args.num_gpus > 1:
             for name, param in global_backbone_params.items():
                 dist.broadcast(param, src=0)
-            if args.use_moe:
+            if 'moe' in args.method:
                 if args.moe_strategy == 'single_expert':
                     for name, param in expert_decoder_params.items():
                         dist.broadcast(param, src=0)
@@ -305,7 +325,7 @@ def run_federated_learning(rank, server_instance, client_instance, args):
                     client_backbone_state[name] = param
             client.backbone.load_state_dict(client_backbone_state)
 
-            if args.use_moe and round > 0:  # 第一次全局训练后才更新专家模型
+            if 'moe' in args.method and round > 0:  # 第一次全局训练后才更新专家模型
                 client.update_expert_model(expert_decoder_params)
             
             # 本地训练
@@ -349,7 +369,7 @@ def run_federated_learning(rank, server_instance, client_instance, args):
             server.evaluate(test_loader)
         
         # 标记第一次全局训练已完成
-        if args.use_moe and round == 0:
+        if 'moe' in args.method and round == 0:
             for client in clients:
                 client.first_global_round_completed = True
     

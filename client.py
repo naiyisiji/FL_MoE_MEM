@@ -87,6 +87,7 @@ class Client:
                 
                 if self.use_moe and self.first_global_round_completed:
                     gate_output = torch.sigmoid(self.gate(features))
+                    # gate_output = torch.softmax(self.decoder(features))
 
                     if self.moe_strategy == 'single_expert' and self.expert_decoder is not None:
                         expert_outputs = self.expert_decoder(features)
@@ -97,6 +98,15 @@ class Client:
                             expert_outputs.append(decoder(features))
                         expert_outputs = torch.stack(expert_outputs, dim=0)
                         gate_weights = torch.softmax(self.gate(features).squeeze(-1), dim=0)
+
+
+                        # simi_ls = []
+                        # for i in range(len(expert_outputs)):
+                        #     simil = similarity(expert_outputs[i], outputs)
+                        #     simi_ls.append(simil)
+                        # gate_weights = torch.softmax(torch.tensor(simi_ls), dim=0)
+
+
                         weighted_expert_outputs = (gate_weights.unsqueeze(-1) * expert_outputs).sum(dim=0)
                         combined_outputs = gate_output * outputs + (1 - gate_output) * weighted_expert_outputs
                     final_outputs = combined_outputs
