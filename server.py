@@ -1,192 +1,204 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from typing import List, Dict, Tuple, Callable, Optional
+import numpy as np
+from copy import deepcopy
+from models import create_local_expert
 
 class Server:
-    def __init__(self, backbone: nn.Module, decoder: nn.Module, device_ids: List[int], 
-                 aggregation_method: str = "fedavg", use_moe=False, moe_strategy='single_expert'):
-        self.device_ids = device_ids
-        self.global_backbone = nn.DataParallel(backbone, device_ids=device_ids)
-        self.global_backbone.to(f"cuda:{device_ids[0]}")
-        self.global_decoder = nn.DataParallel(decoder, device_ids=device_ids)
-        self.global_decoder.to(f"cuda:{device_ids[0]}")
-        self.aggregation_method = aggregation_method
-        self.client_weights = None
+    def __init__(self, encoder, moe_gate, local_expert, pred_head, num_clients, 
+                 encoder_agg_method, moe_agg_method, pred_head_agg_method, device, 
+                 use_moe=False, top_k=2):  # 添加 top_k 参数
+        self.encoder = encoder
+        self.moe_gate = moe_gate
+        self.local_expert = local_expert
+        self.pred_head = pred_head
+        self.num_clients = num_clients
+        self.encoder_agg_method = encoder_agg_method
+        self.moe_agg_method = moe_agg_method
+        self.pred_head_agg_method = pred_head_agg_method
+        self.device = device
         self.use_moe = use_moe
-        self.moe_strategy = moe_strategy
+        self.top_k = top_k  # 初始化 top_k 属性
         
-        # 新增：用于评估的聚合decoder
-        self.evaluation_decoder = nn.DataParallel(decoder, device_ids=device_ids)
-        self.evaluation_decoder.to(f"cuda:{device_ids[0]}")
+        # 为每个客户端创建独热向量
+        self.one_hot_vectors = []
+        for i in range(num_clients):
+            one_hot = np.zeros(num_clients)
+            one_hot[i] = 1.0
+            self.one_hot_vectors.append(one_hot)
         
-        if use_moe:
-            if moe_strategy == 'single_expert':
-                self.expert_decoder = nn.DataParallel(decoder, device_ids=device_ids)
-                self.expert_decoder.to(f"cuda:{device_ids[0]}")
-            elif moe_strategy == 'multi_expert':
-                self.expert_decoders = []
+        # 存储所有客户端的专家模型
+        self.all_experts = [None] * num_clients
+        
+        # 优化器和学习率调度器
+        self.optimizer = torch.optim.Adam(
+            list(self.encoder.parameters()) + 
+            list(self.moe_gate.parameters()) + 
+            list(self.local_expert.parameters()) + 
+            list(self.pred_head.parameters())
+        )
+        
+        # 初始化学习率调度器为None，将在train.py中设置
+        self.lr_scheduler = None
+        
+        # 用于评估的损失函数
+        self.criterion = nn.CrossEntropyLoss()
+    
+    def set_lr_scheduler(self, scheduler):
+        """设置学习率调度器"""
+        self.lr_scheduler = scheduler
+    
+    def get_encoder(self):
+        return deepcopy(self.encoder.state_dict())
+    
+    def get_moe_gate(self):
+        return deepcopy(self.moe_gate.state_dict())
+    
+    def get_local_expert(self):
+        return deepcopy(self.local_expert.state_dict())
+    
+    def get_pred_head(self):
+        return deepcopy(self.pred_head.state_dict())
+    
+    def get_experts_and_vector(self, client_id):
+        """获取所有专家(除了当前客户端自己的)和对应的独热向量"""
+        # 复制所有专家
+        experts = self.all_experts.copy()
+        # 移除当前客户端的专家(将由客户端自己提供)
+        experts[client_id] = None
+        return experts, self.one_hot_vectors[client_id]
+    
+    def aggregate(self, client_updates):
+        """聚合来自客户端的更新"""
+        # 提取所有客户端的更新
+        encoder_updates = [update['encoder'] for update in client_updates]
+        moe_gate_updates = [update['moe_gate'] for update in client_updates]
+        local_expert_updates = [update['local_expert'] for update in client_updates]
+        pred_head_updates = [update['pred_head'] for update in client_updates]
+        
+        # 聚合编码器
+        if self.encoder_agg_method == 'FedAvg':
+            self._fedavg_aggregate(self.encoder, encoder_updates)
+        
+        # 聚合MOE门控
+        if self.use_moe and self.moe_agg_method == 'FedAvg':
+            self._fedavg_aggregate(self.moe_gate, moe_gate_updates)
+        
+        # 聚合预测头
+        if self.pred_head_agg_method == 'FedAvg':
+            self._fedavg_aggregate(self.pred_head, pred_head_updates)
+        
+        # 保存所有客户端的专家模型
+        for update in client_updates:
+            client_id = update['client_id']
+            self.all_experts[client_id] = update['local_expert']
+        
+        # 聚合本地专家(仅当不使用moe时)
+        if not self.use_moe:
+            self._fedavg_aggregate(self.local_expert, local_expert_updates)
+        
+        # 更新学习率
+        if self.lr_scheduler:
+            self.lr_scheduler.step()
+            print(f"全局学习率已更新为: {self.optimizer.param_groups[0]['lr']:.6f}")
+    
+    def _fedavg_aggregate(self, global_model, client_models):
+        """使用FedAvg方法聚合模型参数"""
+        # 获取全局模型的状态字典
+        global_dict = global_model.state_dict()
+        
+        # 初始化聚合后的参数
+        for key in global_dict.keys():
+            if global_dict[key].dtype in [torch.float32, torch.float64]:  # 只处理浮点类型的参数
+                global_dict[key] = torch.zeros_like(global_dict[key])
+        
+        # 聚合所有客户端的参数
+        for client_dict in client_models:
+            for key in global_dict.keys():
+                if global_dict[key].dtype in [torch.float32, torch.float64]:  # 只处理浮点类型的参数
+                    global_dict[key] += client_dict[key] / len(client_models)
+        
+        # 更新全局模型
+        global_model.load_state_dict(global_dict)
 
-    def aggregate(self, client_backbone_params: List[Dict[str, torch.Tensor]], 
-                  client_decoder_params: List[Dict[str, torch.Tensor]],
-                  client_sizes: Optional[List[int]] = None) -> None:
-        """聚合客户端模型参数"""
-        if not client_backbone_params:
-            print("警告: 没有收到任何客户端参数，跳过本轮聚合")
-            return
-            
-        if self.aggregation_method.lower() == "fedavg":
-            # 计算聚合权重
-            if client_sizes is not None and sum(client_sizes) > 0:
-                total_size = sum(client_sizes)
-                weights = [size / total_size for size in client_sizes]
-            else:
-                weights = [1.0 / len(client_backbone_params) for _ in client_backbone_params]
-            
-            # 聚合backbone参数
-            aggregated_backbone_params = {}
-            first_client_backbone_params = client_backbone_params[0]
-            for name in first_client_backbone_params.keys():
-                if name in self.global_backbone.state_dict():
-                    aggregated_backbone_params[name] = weights[0] * first_client_backbone_params[name].clone()
-            for i in range(1, len(client_backbone_params)):
-                client_backbone_state = client_backbone_params[i]
-                for name in client_backbone_state.keys():
-                    if name in self.global_backbone.state_dict():
-                        aggregated_backbone_params[name] += weights[i] * client_backbone_state[name]
-            server_backbone_state = self.global_backbone.state_dict()
-            updated_backbone_state = {}
-            for name in server_backbone_state.keys():
-                if name in aggregated_backbone_params:
-                    updated_backbone_state[name] = aggregated_backbone_params[name]
+    
+    def evaluate(self, test_loader):
+        """在测试集上评估模型"""
+        self.encoder.eval()
+        self.moe_gate.eval()
+        self.local_expert.eval()
+        self.pred_head.eval()
+        
+        test_loss = 0
+        correct = 0
+        total = 0
+        
+        with torch.no_grad():
+            for inputs, labels in test_loader:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                
+                # 前向传播
+                features = self.encoder(inputs)
+                
+                if self.use_moe:
+                    # 使用moe门控选择专家
+                    gate_features = nn.Flatten()(features)
+                    gate_output = self.moe_gate(gate_features)
+
+                    # 保存topk个分数，其他置零并归一化
+                    top_k_values, top_k_indices = torch.topk(gate_output, self.top_k, dim=1)
+                    zeroed_gate_output = torch.zeros_like(gate_output)
+                    batch_size = gate_output.size(0)
+                    for i in range(batch_size):
+                        zeroed_gate_output[i, top_k_indices[i]] = top_k_values[i]
+                    normalized_gate_output = torch.softmax(zeroed_gate_output, dim=1)
+                    
+                    expert_outputs = []
+                    for batch_idx in range(features.size(0)):
+                        batch_expert_output = 0
+                        
+                        for expert_index, expert_state in enumerate(self.all_experts):
+                            if expert_state is not None and normalized_gate_output[batch_idx, expert_index] > 0:
+                                # 创建专家模型实例
+                                expert_input_dim = features.size(1)
+                                expert_output_dim = expert_input_dim
+                                expert = create_local_expert(
+                                    'linear', 
+                                    expert_input_dim, 
+                                    expert_output_dim
+                                ).to(self.device)
+                                expert.load_state_dict(expert_state)
+                                expert_output = expert(features[batch_idx].unsqueeze(0))
+                                batch_expert_output += expert_output * normalized_gate_output[batch_idx, expert_index].unsqueeze(0).unsqueeze(1)
+                        
+                        # 如果没有有效的专家，使用全局专家
+                        if batch_expert_output is 0:
+                            batch_expert_output = self.local_expert(features[batch_idx].unsqueeze(0))
+                        
+                        expert_outputs.append(batch_expert_output)
+                    
+                    expert_outputs = torch.cat(expert_outputs, dim=0)
+                    outputs = self.pred_head(expert_outputs)
                 else:
-                    updated_backbone_state[name] = server_backbone_state[name]
-            self.global_backbone.load_state_dict(updated_backbone_state)
-
-            # 聚合decoder参数到evaluation_decoder
-            aggregated_decoder_params = {}
-            first_client_decoder_params = client_decoder_params[0]
-            for name in first_client_decoder_params.keys():
-                if name in self.evaluation_decoder.state_dict():
-                    aggregated_decoder_params[name] = weights[0] * first_client_decoder_params[name].clone()
-            for i in range(1, len(client_decoder_params)):
-                client_decoder_state = client_decoder_params[i]
-                for name in client_decoder_state.keys():
-                    if name in self.evaluation_decoder.state_dict():
-                        aggregated_decoder_params[name] += weights[i] * client_decoder_state[name]
-            evaluation_decoder_state = self.evaluation_decoder.state_dict()
-            for name in evaluation_decoder_state.keys():
-                if name in aggregated_decoder_params:
-                    evaluation_decoder_state[name] = aggregated_decoder_params[name]
-            self.evaluation_decoder.load_state_dict(evaluation_decoder_state)
-
-            # 处理decoder参数（用于MoE）
-            if self.use_moe:
-                if self.moe_strategy == 'single_expert':
-                    # 简单平均聚合decoder作为单一专家模型
-                    expert_decoder_state = self.expert_decoder.state_dict()
-                    for name in expert_decoder_state.keys():
-                        if name in aggregated_decoder_params:
-                            expert_decoder_state[name] = aggregated_decoder_params[name]
-                    self.expert_decoder.load_state_dict(expert_decoder_state)
-                elif self.moe_strategy == 'multi_expert':
-                    # 获取输入和输出维度
-                    base_decoder = self.global_decoder.module
-                    if isinstance(base_decoder, nn.Linear):
-                        in_features = base_decoder.in_features
-                        out_features = base_decoder.out_features
-                    else:
-                        try:
-                            in_features = base_decoder[0].in_features
-                            out_features = base_decoder[-1].out_features
-                        except:
-                            raise ValueError("无法确定decoder的输入输出维度")
-                    
-                    # 创建多个专家decoder
-                    self.expert_decoders = []
-                    for _ in range(len(client_decoder_params)):
-                        if isinstance(base_decoder, nn.Linear):
-                            new_decoder = nn.Linear(in_features, out_features)
-                        else:
-                            new_decoder = type(base_decoder)(in_features, out_features)
-                        expert_decoder = nn.DataParallel(new_decoder, device_ids=self.device_ids)
-                        expert_decoder.to(f"cuda:{self.device_ids[0]}")
-                        self.expert_decoders.append(expert_decoder)
-                    
-                    # 加载每个专家模型的参数
-                    for i, decoder in enumerate(self.expert_decoders):
-                        decoder_state = decoder.state_dict()
-                        for name, param in client_decoder_params[i].items():
-                            if name in decoder_state:
-                                decoder_state[name] = param
-                        decoder.load_state_dict(decoder_state)
-        else:
-            raise ValueError(f"不支持的聚合方法: {self.aggregation_method}")
-
-    def evaluate(self, test_loader: DataLoader, criterion: Callable = nn.CrossEntropyLoss()) -> Tuple[float, float]:
-        """在全局测试集上评估模型"""
-        self.global_backbone.eval()
-        self.evaluation_decoder.eval()  # 使用聚合后的decoder进行评估
-        
-        total_loss = 0.0
-        correct = 0
-        total = 0
-        
-        with torch.no_grad():
-            for inputs, labels in test_loader:
-                inputs, labels = inputs.to(f"cuda:{self.device_ids[0]}"), labels.to(f"cuda:{self.device_ids[0]}")
-                features = self.global_backbone(inputs)
-                features = features.view(features.size(0), -1)
-                outputs = self.evaluation_decoder(features)  # 使用evaluation_decoder
-                loss = criterion(outputs, labels)
+                    # 不使用moe
+                    local_output = self.local_expert(features)
+                    outputs = self.pred_head(local_output)
                 
-                total_loss += loss.item()
+                # 计算损失和准确率
+                loss = self.criterion(outputs, labels)
+                test_loss += loss.item()
                 _, predicted = outputs.max(1)
                 total += labels.size(0)
                 correct += predicted.eq(labels).sum().item()
         
+        # 计算平均损失和准确率
+        avg_loss = test_loss / len(test_loader)
         accuracy = 100. * correct / total
-        avg_loss = total_loss / len(test_loader)
         
-        print(f"全局模型测试结果: 损失 = {avg_loss:.4f}, 准确率 = {accuracy:.2f}%")
-        return avg_loss, accuracy
-
-    def broadcast(self) -> Dict[str, Dict[str, torch.Tensor]]:
-        """广播全局模型参数给客户端"""
-        global_backbone_params = {k: v.cpu().detach() for k, v in self.global_backbone.state_dict().items()}
-        if self.use_moe:
-            if self.moe_strategy == 'single_expert':
-                expert_decoder_params = {k: v.cpu().detach() for k, v in self.expert_decoder.state_dict().items()}
-            elif self.moe_strategy == 'multi_expert':
-                expert_decoder_params = []
-                for decoder in self.expert_decoders:
-                    expert_decoder_params.append({k: v.cpu().detach() for k, v in decoder.state_dict().items()})
-            return {'global_backbone': global_backbone_params, 'expert_decoder': expert_decoder_params}
-        return {'global_backbone': global_backbone_params}
-
-    def evaluate_(self, test_loader: DataLoader, criterion: Callable = nn.CrossEntropyLoss()) -> Tuple[float, float]:
-        """在全局测试集上评估模型"""
-        self.global_backbone.eval()
-        self.global_decoder.eval()
-        total_loss = 0.0
-        correct = 0
-        total = 0
+        # 将模型设置回训练模式
+        self.encoder.train()
+        self.moe_gate.train()
+        self.local_expert.train()
+        self.pred_head.train()
         
-        with torch.no_grad():
-            for inputs, labels in test_loader:
-                inputs, labels = inputs.to(f"cuda:{self.device_ids[0]}"), labels.to(f"cuda:{self.device_ids[0]}")
-                features = self.global_backbone(inputs)
-                features = features.view(features.size(0), -1)
-                outputs = self.global_decoder(features)
-                loss = criterion(outputs, labels)
-                
-                total_loss += loss.item()
-                _, predicted = outputs.max(1)
-                total += labels.size(0)
-                correct += predicted.eq(labels).sum().item()
-        
-        accuracy = 100. * correct / total
-        avg_loss = total_loss / len(test_loader)
-        
-        print(f"全局模型测试结果: 损失 = {avg_loss:.4f}, 准确率 = {accuracy:.2f}%")
         return avg_loss, accuracy

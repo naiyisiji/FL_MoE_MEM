@@ -1,357 +1,239 @@
 import os
+import json
 import torch
-import torch.nn as nn
-import torch.distributed as dist
-from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import datasets, models, transforms
+import torchvision
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
 import numpy as np
-import random
-from typing import List
+from server import Server
+from client import Client
+from models import create_encoder, create_moe_gate, create_local_expert, create_pred_head
 
-def setup(rank, world_size, port=12355):
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = str(port)
+def train(args):
+    # 创建工作目录和最佳模型文件夹
+    work_dir = os.path.join(os.getcwd(), 'work_dir')
+    best_model_dir = os.path.join(work_dir, 'best_model')
+    os.makedirs(work_dir, exist_ok=True)
+    os.makedirs(best_model_dir, exist_ok=True)
     
-    # 初始化进程组
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    # 数据预处理
+    transform = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225))
+    ])
     
-    # 设置GPU设备
-    torch.cuda.set_device(rank)
-
-def cleanup():
-    dist.destroy_process_group()
-
-def create_model(model_name: str = "resnet18", num_classes: int = 10, pretrained: bool = True):
-    if model_name.lower() == "resnet18":
-        # 根据pretrained参数决定是否加载预训练权重
-        model = models.resnet18(pretrained=pretrained)
-        backbone = nn.Sequential(*list(model.children())[:-1])
-        decoder = nn.Linear(model.fc.in_features, num_classes)
-        gate = nn.Linear(model.fc.in_features, 1)  # 可学门控模型
-        return backbone, decoder, gate
-    elif model_name.lower() == "simple_cnn":
-        class SimpleCNN(nn.Module):
-            def __init__(self, num_classes=10):
-                super(SimpleCNN, self).__init__()
-                self.backbone = nn.Sequential(
-                    nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(kernel_size=2),
-                    nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-                    nn.ReLU(),
-                    nn.MaxPool2d(kernel_size=2)
-                )
-                self.decoder = nn.Sequential(
-                    nn.Linear(32 * 7 * 7, 128),
-                    nn.ReLU(),
-                    nn.Linear(128, num_classes)
-                )
-                self.gate = nn.Linear(32 * 7 * 7, 1)  # 可学门控模型
-
-            def forward(self, x):
-                x = self.backbone(x)
-                x = x.view(-1, 32 * 7 * 7)
-                gate_output = torch.sigmoid(self.gate(x))
-                output = self.decoder(x)
-                return output, gate_output
-
-        backbone = SimpleCNN().backbone
-        decoder = SimpleCNN().decoder
-        gate = SimpleCNN().gate
-        return backbone, decoder, gate
-    else:
-        raise ValueError(f"不支持的模型: {model_name}")
+    # 加载数据集
+    trainset = torchvision.datasets.CIFAR10(root='./data', train=True,
+                                            download=True, transform=transform)
+    testset = torchvision.datasets.CIFAR10(root='./data', train=False,
+                                           download=True, transform=transform)
     
-class DataSplitter:
-    @staticmethod
-    def iid_split(dataset: Dataset, num_clients: int) -> List[List[int]]:
-        num_samples = len(dataset) // num_clients
-        client_indices = [[] for _ in range(num_clients)]
-        indices = list(range(len(dataset)))
-        random.shuffle(indices)
+    # 根据百分比选择数据
+    if args.data_percentage < 1.0:
+        num_train_samples = int(len(trainset) * args.data_percentage)
+        num_test_samples = int(len(testset) * args.data_percentage)
         
-        for i in range(num_clients):
-            client_indices[i] = indices[i * num_samples : (i + 1) * num_samples]
+        train_indices = np.random.choice(len(trainset), num_train_samples, replace=False)
+        test_indices = np.random.choice(len(testset), num_test_samples, replace=False)
         
-        return client_indices
+        trainset = Subset(trainset, train_indices)
+        testset = Subset(testset, test_indices)
     
-    @staticmethod
-    def non_iid_split(dataset: Dataset, num_clients: int, num_classes_per_client: int = 2) -> List[List[int]]:
-        client_indices = [[] for _ in range(num_clients)]
-        
-        # 假设数据集有一个targets属性存储标签
-        if hasattr(dataset, 'targets'):
-            targets = dataset.targets
-            if isinstance(targets, torch.Tensor):
-                targets = targets.numpy()
-        else:
-            # 如果没有targets属性，遍历数据集获取标签
-            targets = np.array([dataset[i][1] for i in range(len(dataset))])
-        
-        classes = np.unique(targets)
-        num_classes = len(classes)
-        
-        # 为每个客户端分配特定的类别
-        class_assignments = []
-        for i in range(num_clients):
-            client_classes = random.sample(list(classes), num_classes_per_client)
-            class_assignments.append(client_classes)
-        
-        # 为每个类别创建索引列表
-        class_indices = {c: np.where(targets == c)[0].tolist() for c in classes}
-        
-        # 为每个客户端分配样本
-        for i in range(num_clients):
-            client_classes = class_assignments[i]
-            for c in client_classes:
-                # 每个类别分配相等数量的样本
-                num_samples_per_class = len(class_indices[c]) // num_clients
-                client_indices[i].extend(class_indices[c][i * num_samples_per_class : (i + 1) * num_samples_per_class])
-        
-        return client_indices
-    
-    @staticmethod
-    def dirichlet_split(dataset: Dataset, num_clients: int, alpha: float = 0.5) -> List[List[int]]:
-        if hasattr(dataset, 'targets'):
-            targets = dataset.targets
-            if isinstance(targets, torch.Tensor):
-                targets = targets.numpy()
-        else:
-            targets = np.array([dataset[i][1] for i in range(len(dataset))])
-        
-        classes = np.unique(targets)
-        num_classes = len(classes)
-        
-        client_dist = np.random.dirichlet([alpha] * num_clients, num_classes)
-        
-        client_indices = [[] for _ in range(num_clients)]
-        
-        for c in classes:
-            class_indices = np.where(targets == c)[0]
-            np.random.shuffle(class_indices)
-            
-            proportions = client_dist[c]
-            cumulative = np.cumsum(proportions)
-            cumulative = np.round(cumulative * len(class_indices)).astype(int)
-            cumulative = np.insert(cumulative, 0, 0)
-            
-            for i in range(num_clients):
-                client_indices[i].extend(class_indices[cumulative[i]:cumulative[i+1]])
-        
-        return client_indices
-
-def run_federated_learning(rank, server_instance, client_instance, args):
-    if args.num_gpus > 1:
-        setup(rank, args.num_gpus, port=12355 + rank)
-    # device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
-    if args.dataset.lower() == "mnist":
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-        test_dataset = datasets.MNIST('./data', train=False, transform=transform)
-        num_classes = 10
-        # 对于MNIST，如果使用resnet，需要调整输入通道数
-        if args.model.lower() == "resnet18":
-            backbone, decoder, gate = create_model(args.model, num_classes)
-            backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-    elif args.dataset.lower() == "cifar10":
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
-        train_dataset = datasets.CIFAR10('./data', train=True, download=True, transform=transform)
-        test_dataset = datasets.CIFAR10('./data', train=False, transform=transform)
-        num_classes = 10
-    else:
-        raise ValueError(f"不支持的数据集: {args.dataset}")
-    
-    # 分割数据集
-    if args.split_method.lower() == "iid":
-        client_indices = DataSplitter.iid_split(train_dataset, args.num_clients)
-    elif args.split_method.lower() == "non-iid":
-        client_indices = DataSplitter.non_iid_split(train_dataset, args.num_clients)
-    elif args.split_method.lower() == "dirichlet":
-        client_indices = DataSplitter.dirichlet_split(train_dataset, args.num_clients, alpha=args.alpha)
-    else:
-        raise ValueError(f"不支持的数据分割方法: {args.split_method}")
+    # 使用相同的数据划分方法划分测试集
+    test_datasets = split_data(testset, args.num_clients, args.data_split_method)
+    testloaders = [DataLoader(tds, batch_size=args.batch_size, shuffle=False) 
+                  for tds in test_datasets]
     
     # 创建全局测试数据加载器
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size)
+    global_testloader = DataLoader(testset, batch_size=args.batch_size, shuffle=False)
     
     # 创建模型
-    if args.dataset.lower() == "mnist" and args.model.lower() == "resnet18":
-        # 已经在上面调整了MNIST的resnet输入通道
-        global_backbone = backbone
-        global_decoder = decoder
-        global_gate = gate
-    else:
-        global_backbone, global_decoder, global_gate = create_model(args.model, num_classes)
+    encoder_output_dim = 512
+    output_dim = 10
     
-    # 公平分配GPU资源
-    total_gpus = min(args.num_gpus, torch.cuda.device_count()) if torch.cuda.is_available() else 1
+    # 创建Server
+    server_encoder = create_encoder(args.encoder_type, pretrained=False).to(args.device)
+    server_moe_gate = create_moe_gate(args.moe_gate_type, encoder_output_dim, args.num_clients).to(args.device)
+    server_local_expert = create_local_expert(args.local_expert_type, encoder_output_dim, encoder_output_dim).to(args.device)
+    server_pred_head = create_pred_head(args.encoder_type, encoder_output_dim, output_dim).to(args.device)
     
-    # 计算服务器和客户端应分配的GPU比例
-    server_gpu_share = min(args.server_gpus, total_gpus)
-    client_gpu_share = total_gpus - server_gpu_share
+    server = Server(
+        encoder=server_encoder,
+        moe_gate=server_moe_gate,
+        local_expert=server_local_expert,
+        pred_head=server_pred_head,
+        num_clients=args.num_clients,
+        encoder_agg_method=args.encoder_agg_method,
+        moe_agg_method=args.moe_agg_method,
+        pred_head_agg_method=args.pred_head_agg_method,
+        device=args.device,
+        use_moe=args.use_moe
+    )
     
-    if client_gpu_share < 1:
-        # 如果没有足够的GPU给客户端，调整分配
-        server_gpu_share = 1
-        client_gpu_share = max(1, total_gpus - 1)
-    
-    # 分配GPU给服务器和客户端
-    gpu_indices = list(range(total_gpus))
-    
-    # 循环分配GPU，确保公平性
-    server_gpus = []
-    client_gpu_assignments = [[] for _ in range(args.num_clients)]
-    
-    # 先分配服务器的GPU
-    for i in range(server_gpu_share):
-        server_gpus.append(gpu_indices[i % total_gpus])
-    
-    # 再分配客户端的GPU
-    client_idx = 0
-    for i in range(server_gpu_share, total_gpus):
-        client_gpu_assignments[client_idx].append(gpu_indices[i])
-        client_idx = (client_idx + 1) % args.num_clients
-    
-    # 如果客户端数量多于剩余GPU，循环分配
-    if args.num_clients > client_gpu_share and client_gpu_share > 0:
-        for i in range(args.num_clients):
-            if not client_gpu_assignments[i]:
-                client_gpu_assignments[i].append(gpu_indices[i % client_gpu_share])
-    
-    # 服务器只在第一个进程上运行
-    if rank == 0:
-        print(f"服务器使用GPU: {server_gpus}")
-        server = server_instance(global_backbone, global_decoder, server_gpus, args.aggregation, use_moe=args.use_moe, moe_strategy=args.moe_strategy)
-        
-        # 记录全局模型性能
-        server.evaluate(test_loader)
-    
-    # 客户端在所有进程上分布
-    clients_per_process = args.num_clients // args.num_gpus
-    start_client = rank * clients_per_process
-    end_client = (rank + 1) * clients_per_process if rank < args.num_gpus - 1 else args.num_clients
-    
+    # 创建Clients
     clients = []
-    for i in range(start_client, end_client):
-        # 为每个客户端创建本地数据集
-        client_train_data = Subset(train_dataset, client_indices[i])
-        client_test_data = test_dataset  # 所有客户端使用相同的测试集
+    client_datasets = split_data(trainset, args.num_clients, args.data_split_method)
+    
+    for client_id in range(args.num_clients):
+        client_encoder = create_encoder(args.encoder_type, pretrained=False).to(args.device)
+        client_moe_gate = create_moe_gate(args.moe_gate_type, encoder_output_dim, args.num_clients).to(args.device)
+        client_local_expert = create_local_expert(args.local_expert_type, encoder_output_dim, encoder_output_dim).to(args.device)
+        client_pred_head = create_pred_head(args.encoder_type, encoder_output_dim, output_dim).to(args.device)
         
-        # 每个客户端有自己的模型副本
-        client_backbone, client_decoder, client_gate = create_model(args.model, num_classes)
-        if args.dataset.lower() == "mnist" and args.model.lower() == "resnet18":
-            client_backbone.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        
-        # 创建客户端，分配对应的GPU
-        print(f"客户端 {i} 使用GPU: {client_gpu_assignments[i]}")
-        client = client_instance(
-            client_id=i,
-            train_data=client_train_data,
-            test_data=client_test_data,
-            backbone=client_backbone,
-            decoder=client_decoder,
-            gate=client_gate,
-            device_ids=client_gpu_assignments[i],
+        client = Client(
+            client_id=client_id,
+            encoder=client_encoder,
+            moe_gate=client_moe_gate,
+            local_expert=client_local_expert,
+            pred_head=client_pred_head,
+            train_data=client_datasets[client_id],
             batch_size=args.batch_size,
-            lr=args.lr,
-            epochs=args.local_epochs,
-            optimizer=args.optimizer,
-            criterion=nn.CrossEntropyLoss(),
+            device=args.device,
             use_moe=args.use_moe,
-            moe_strategy=args.moe_strategy
+            a_weight=args.a_weight,
+            b_weight=args.b_weight,
+            top_k=args.top_k,
+            lr=args.lr
         )
         clients.append(client)
     
+    # 设置学习率调度器
+    from torch.optim import lr_scheduler
+    scheduler = lr_scheduler.StepLR(server.optimizer, step_size=args.lr_decay_step, gamma=args.lr_decay_gamma)
+    server.set_lr_scheduler(scheduler)
+    
+    # 初始化最佳准确率和模型保存路径
+    best_accuracy = 0.0
+    model_params_path = os.path.join(best_model_dir, 'model_params.pth')
+    info_json_path = os.path.join(best_model_dir, 'info.json')
+    
     # 联邦学习训练循环
-    for round in range(args.global_rounds):
-        print(f"\n===== 全局轮次 {round+1}/{args.global_rounds} =====")
+    for round in range(args.num_rounds):
+        print(f"\n=== 第 {round+1}/{args.num_rounds} 轮 ===")
         
-        # 服务器广播全局模型
-        if rank == 0:
-            broadcast_params = server.broadcast()
-            global_backbone_params = broadcast_params['global_backbone']
-            if args.use_moe:
-                expert_decoder_params = broadcast_params['expert_decoder']
+        # 客户端本地训练和评估
+        client_updates = []
+        client_test_results = []  # 收集客户端测试结果
         
-        # 同步全局模型到所有GPU
-        if args.num_gpus > 1:
-            for name, param in global_backbone_params.items():
-                dist.broadcast(param, src=0)
-            if args.use_moe:
-                if args.moe_strategy == 'single_expert':
-                    for name, param in expert_decoder_params.items():
-                        dist.broadcast(param, src=0)
-                elif args.moe_strategy == 'multi_expert':
-                    for expert in expert_decoder_params:
-                        for name, param in expert.items():
-                            dist.broadcast(param, src=0)
-        
-        # 客户端训练
-        client_backbone_updates = []
-        client_decoder_updates = []
-        client_sizes = []
-        
-        for client in clients:
-            # 更新客户端模型为全局模型
-            client_backbone_state = client.backbone.state_dict()
-            for name, param in global_backbone_params.items():
-                if name in client_backbone_state:
-                    client_backbone_state[name] = param
-            client.backbone.load_state_dict(client_backbone_state)
-
-            if args.use_moe and round > 0:  # 第一次全局训练后才更新专家模型
-                client.update_expert_model(expert_decoder_params)
+        for client_id, client in enumerate(clients):
+            # 从服务器获取全局模型参数
+            global_encoder = server.get_encoder()
+            global_moe_gate = server.get_moe_gate()
+            global_local_expert = server.get_local_expert()
+            global_pred_head = server.get_pred_head()
+            experts, one_hot_vector = server.get_experts_and_vector(client.client_id)
+            
+            # 设置客户端模型参数
+            client.set_encoder(global_encoder)
+            client.set_moe_gate(global_moe_gate)
+            client.set_local_expert(global_local_expert)
+            client.set_pred_head(global_pred_head)
+            client.set_experts(experts, one_hot_vector)
             
             # 本地训练
-            try:
-                client_backbone_params, client_decoder_params = client.train()
-                client_backbone_updates.append(client_backbone_params)
-                client_decoder_updates.append(client_decoder_params)
-                client_sizes.append(len(client.train_data))
-            except Exception as e:
-                print(f"客户端 {client.client_id} 训练出错: {e}")
-                # 可以选择跳过此客户端或采取其他恢复措施
+            print(f"客户端 {client.client_id} 本地训练中...")
+            encoder, moe_gate, local_expert, pred_head = client.train(args.local_epochs)
+            
+            # 评估本地模型并保存结果
+            local_loss, local_acc = client.evaluate(testloaders[client_id])
+            print(f"客户端 {client.client_id} 本地模型测试结果: Loss = {local_loss:.4f}, Acc = {local_acc:.4f}")
+            client_test_results.append({
+                "client_id": client.client_id,
+                "test_loss": float(local_loss),
+                "test_accuracy": float(local_acc)
+            })
+            
+            # 保存客户端更新
+            client_updates.append({
+                'client_id': client.client_id,
+                'encoder': encoder,
+                'moe_gate': moe_gate,
+                'local_expert': local_expert,
+                'pred_head': pred_head
+            })
         
-        # 收集所有GPU上的客户端更新
-        all_backbone_updates = [None] * args.num_gpus
-        all_decoder_updates = [None] * args.num_gpus
-        all_sizes = [None] * args.num_gpus
+        # 服务器聚合模型参数
+        server.aggregate(client_updates)
         
-        if args.num_gpus > 1:
-            # 使用all_gather收集所有进程的客户端更新
-            dist.all_gather_object(all_backbone_updates, client_backbone_updates)
-            dist.all_gather_object(all_decoder_updates, client_decoder_updates)
-            dist.all_gather_object(all_sizes, client_sizes)
-        else:
-            all_backbone_updates[0] = client_backbone_updates
-            all_decoder_updates[0] = client_decoder_updates
-            all_sizes[0] = client_sizes
+        # 服务器评估模型
+        global_test_loss, global_test_acc = server.evaluate(global_testloader)
+        print(f"全局模型测试结果: Loss = {global_test_loss:.4f}, Acc = {global_test_acc:.4f}")
         
-        # 展平收集到的更新
-        flattened_backbone_updates = [update for process_updates in all_backbone_updates if process_updates is not None for update in process_updates]
-        flattened_decoder_updates = [update for process_updates in all_decoder_updates if process_updates is not None for update in process_updates]
-        flattened_sizes = [size for process_sizes in all_sizes if process_sizes is not None for size in process_sizes]
-        
-        # 服务器聚合模型
-        if rank == 0:
-            if not flattened_backbone_updates:
-                print("警告: 没有收集到任何客户端更新，跳过本轮聚合")
-                continue
-                
-            server.aggregate(flattened_backbone_updates, flattened_decoder_updates, flattened_sizes)
-            # 评估全局模型
-            server.evaluate(test_loader)
-        
-        # 标记第一次全局训练已完成
-        if args.use_moe and round == 0:
-            for client in clients:
-                client.first_global_round_completed = True
-    
-    if args.num_gpus > 1:
-        cleanup()
+        # 保存最佳模型及信息
+        if global_test_acc > best_accuracy:
+            best_accuracy = global_test_acc
+            print(f"新的最佳准确率: {best_accuracy:.4f}, 保存模型到 {best_model_dir}")
+            
+            # 1. 保存模型参数
+            model_state = {
+                'encoder': server.get_encoder(),
+                'moe_gate': server.get_moe_gate(),
+                'local_expert': server.get_local_expert(),
+                'pred_head': server.get_pred_head(),
+                'accuracy': best_accuracy,
+                'round': round + 1
+            }
+            torch.save(model_state, model_params_path)
+            
+            # 2. 准备需要保存的信息
+            save_info = {
+                "hyperparameters": vars(args),  # 超参数
+                "global_test_result": {
+                    "test_loss": float(global_test_loss),
+                    "test_accuracy": float(global_test_acc),
+                    "best_round": round + 1
+                },
+                "client_test_results": client_test_results  # 客户端测试结果
+            }
+            
+            # 3. 保存为JSON文件
+            with open(info_json_path, 'w', encoding='utf-8') as f:
+                json.dump(save_info, f, ensure_ascii=False, indent=4)
+
+def split_data(dataset, num_clients, data_split_method):
+    """将数据集分割给多个客户端"""
+    if data_split_method == 'iid':
+        indices = np.arange(len(dataset))
+        np.random.shuffle(indices)
+        client_datasets = []
+        data_per_client = len(dataset) // num_clients
+        for i in range(num_clients):
+            start_idx = i * data_per_client
+            end_idx = start_idx + data_per_client if i < num_clients - 1 else len(dataset)
+            client_indices = indices[start_idx:end_idx]
+            client_dataset = Subset(dataset, client_indices)
+            client_datasets.append(client_dataset)
+        return client_datasets
+    elif data_split_method == 'non-iid':
+        labels = np.array([dataset[i][1] for i in range(len(dataset))])
+        sorted_indices = np.argsort(labels)
+        client_datasets = []
+        data_per_client = len(dataset) // num_clients
+        for i in range(num_clients):
+            start_idx = i * data_per_client
+            end_idx = start_idx + data_per_client if i < num_clients - 1 else len(dataset)
+            client_indices = sorted_indices[start_idx:end_idx]
+            client_dataset = Subset(dataset, client_indices)
+            client_datasets.append(client_dataset)
+        return client_datasets
+    elif data_split_method == 'dirichlet':
+        num_classes = len(np.unique([dataset[i][1] for i in range(len(dataset))]))
+        alpha = 0.5
+        label_distribution = np.random.dirichlet([alpha] * num_clients, num_classes)
+        class_indices = [np.where(np.array([dataset[i][1] for i in range(len(dataset))]) == c)[0] for c in range(num_classes)]
+        client_indices = [[] for _ in range(num_clients)]
+        for c in range(num_classes):
+            class_idx = class_indices[c]
+            np.random.shuffle(class_idx)
+            proportions = np.round(label_distribution[c] * len(class_idx)).astype(int)
+            proportions[-1] = len(class_idx) - np.sum(proportions[:-1])
+            start_idx = 0
+            for i in range(num_clients):
+                end_idx = start_idx + proportions[i]
+                client_indices[i].extend(class_idx[start_idx:end_idx])
+                start_idx = end_idx
+        client_datasets = [Subset(dataset, indices) for indices in client_indices]
+        return client_datasets
+    else:
+        raise ValueError(f"不支持的数据划分方法: {data_split_method}")
