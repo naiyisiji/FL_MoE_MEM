@@ -63,12 +63,17 @@ class Client:
         self.local_expert.train()
         self.pred_head.train()
 
+        total_batches = 0  # 记录有效的批次数量
         for epoch in range(local_epochs):
             total_loss = 0.0
             correct = 0
             total = 0
 
             for inputs, labels in train_loader:
+                # 跳过批量大小为1的批次
+                if inputs.size(0) == 1:
+                    continue
+
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
 
                 # 清空梯度
@@ -189,9 +194,11 @@ class Client:
                 optimizer.step()
 
                 total_loss += loss.item()
+                total_batches += 1
 
             # 打印本轮训练结果
-            print(f"客户端 {self.client_id}, 轮次 {epoch+1}/{local_epochs}, 损失: {total_loss/len(train_loader):.4f}, 准确率: {100.*correct/total:.2f}%")
+            if total_batches > 0:
+                print(f"客户端 {self.client_id}, 轮次 {epoch+1}/{local_epochs}, 损失: {total_loss/total_batches:.4f}, 准确率: {100.*correct/total:.2f}%")
 
         # 返回更新后的模型参数
         return (self.encoder.state_dict(), 
@@ -212,6 +219,10 @@ class Client:
         
         with torch.no_grad():
             for inputs, labels in test_loader:
+                # 跳过批量大小为1的批次
+                if inputs.size(0) == 1:
+                    continue
+
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 if self.use_moe and self.experts is not None:
                     features = self.encoder(inputs)
@@ -292,13 +303,16 @@ class Client:
                 correct += predicted.eq(labels).sum().item()
         
         # 计算平均损失和准确率
-        avg_loss = test_loss / len(test_loader)
-        accuracy = 100. * correct / total
+        if len(test_loader) > 0:
+            avg_loss = test_loss / len(test_loader)
+            accuracy = 100. * correct / total
         
-        # 将模型设置回训练模式
-        self.encoder.train()
-        self.moe_gate.train()
-        self.local_expert.train()
-        self.pred_head.train()
+            # 将模型设置回训练模式
+            self.encoder.train()
+            self.moe_gate.train()
+            self.local_expert.train()
+            self.pred_head.train()
         
-        return avg_loss, accuracy
+            return avg_loss, accuracy
+        else:
+            return 0, 0
